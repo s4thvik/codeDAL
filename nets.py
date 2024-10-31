@@ -77,27 +77,44 @@ class Net:
         self.params = params
         self.device = device
 
-    def train(self, data):
-        n_epoch = self.params['n_epoch']
         num_classes = self.params['num_classes']
         self.clf = self.net_cls(num_classes=num_classes).to(self.device)
+
+        # Initialize optimizer and scheduler
+        self.optimizer = optim.SGD(self.clf.parameters(), **self.params['optimizer_args'])
+        self.scheduler = StepLR(self.optimizer, step_size=30, gamma=0.1)  # Adjusted step_size for 100 epochs
+
+        # Initialize seen classes
+        self.seen_classes = []
+        self.num_seen_classes = 0
+
+    def update_seen_classes(self, seen_classes):
+        self.seen_classes = seen_classes
+        self.num_seen_classes = len(seen_classes)
+        self.seen_classes_tensor = torch.tensor(self.seen_classes).to(self.device)
+
+    def train(self, data):
+        n_epoch = self.params['n_epoch']
         self.clf.train()
-        optimizer = optim.SGD(self.clf.parameters(), **self.params['optimizer_args'])
-        scheduler = StepLR(optimizer, step_size=5, gamma=0.5)
 
         loader = DataLoader(data, shuffle=True, **self.params['train_args'])
         for epoch in range(1, n_epoch + 1):
             with tqdm(loader, ncols=100, leave=True, desc=f"Epoch {epoch}/{n_epoch}") as t:
                 for batch_idx, (x, y, idxs) in enumerate(t):
                     x, y = x.to(self.device), y.to(self.device)
-                    optimizer.zero_grad()
+
+                    self.optimizer.zero_grad()
                     out, _ = self.clf(x)
+
+                    # Select outputs for seen classes
+                    out = out[:, self.seen_classes]
+
                     loss = F.cross_entropy(out, y)
                     loss.backward()
-                    optimizer.step()
+                    self.optimizer.step()
                     t.set_postfix(loss=loss.item())
 
-            scheduler.step()
+            self.scheduler.step()
 
     def predict(self, data):
         self.clf.eval()
@@ -107,33 +124,45 @@ class Net:
             for x, y, idxs in loader:
                 x = x.to(self.device)
                 out, _ = self.clf(x)
+
+                # Select outputs for seen classes
+                out = out[:, self.seen_classes]
+
                 pred = out.max(1)[1]
                 preds[idxs] = pred.cpu()
         return preds
 
     def predict_prob(self, data):
         self.clf.eval()
-        num_classes = self.params['num_classes']
-        probs = torch.zeros([len(data), num_classes])
+        num_samples = len(data)
+        probs = torch.zeros([num_samples, self.num_seen_classes])
         loader = DataLoader(data, shuffle=False, **self.params['test_args'])
         with torch.no_grad():
             for x, y, idxs in loader:
                 x = x.to(self.device)
                 out, _ = self.clf(x)
+
+                # Select outputs for seen classes
+                out = out[:, self.seen_classes]
+
                 prob = F.softmax(out, dim=1)
                 probs[idxs] = prob.cpu()
         return probs
 
     def predict_prob_dropout(self, data, n_drop=10):
         self.clf.train()  # Enable dropout layers
-        num_classes = self.params['num_classes']
-        probs = torch.zeros([len(data), num_classes])
+        num_samples = len(data)
+        probs = torch.zeros([num_samples, self.num_seen_classes])
         loader = DataLoader(data, shuffle=False, **self.params['test_args'])
         for _ in range(n_drop):
             with torch.no_grad():
                 for x, y, idxs in loader:
                     x = x.to(self.device)
                     out, _ = self.clf(x)
+
+                    # Select outputs for seen classes
+                    out = out[:, self.seen_classes]
+
                     prob = F.softmax(out, dim=1)
                     probs[idxs] += prob.cpu()
         probs /= n_drop

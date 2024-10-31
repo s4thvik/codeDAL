@@ -32,7 +32,7 @@ params = {
         'num_classes': 10
     },
     'CIFAR100': {
-        'n_epoch': 25,
+        'n_epoch': 100,  # Ensured this matches the desired number of epochs
         'train_args': {'batch_size': 128, 'num_workers': 2},
         'test_args': {'batch_size': 100, 'num_workers': 2},
         'optimizer_args': {'lr': 0.1, 'momentum': 0.9, 'weight_decay': 5e-4},
