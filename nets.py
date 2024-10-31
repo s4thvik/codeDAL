@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from torch.optim.lr_scheduler import StepLR
 
 # Define ResNet-18 for CIFAR-100
 class BasicBlock(nn.Module):
@@ -66,6 +67,7 @@ class ResNet(nn.Module):
 def ResNet18(num_classes=100):
     return ResNet(BasicBlock, [2, 2, 2, 2], num_classes)
 
+
 class Net:
     def __init__(self, net, params, device):
         self.net = net
@@ -77,16 +79,21 @@ class Net:
         self.clf = self.net().to(self.device)
         self.clf.train()
         optimizer = optim.SGD(self.clf.parameters(), **self.params['optimizer_args'])
+        scheduler = StepLR(optimizer, step_size=5, gamma=0.5)
 
         loader = DataLoader(data, shuffle=True, **self.params['train_args'])
-        for epoch in tqdm(range(1, n_epoch + 1), ncols=100):
-            for batch_idx, (x, y, idxs) in enumerate(loader):
-                x, y = x.to(self.device), y.to(self.device)
-                optimizer.zero_grad()
-                out, _ = self.clf(x)  # we don't need embedding in training
-                loss = F.cross_entropy(out, y)
-                loss.backward()
-                optimizer.step()
+        for epoch in range(1, n_epoch + 1):
+            with tqdm(loader, ncols=100, leave=True, desc=f"Epoch {epoch}/{n_epoch}") as t:
+                for batch_idx, (x, y, idxs) in enumerate(t):
+                    x, y = x.to(self.device), y.to(self.device)
+                    optimizer.zero_grad()
+                    out, _ = self.clf(x)  # we don't need embedding in training
+                    loss = F.cross_entropy(out, y)
+                    loss.backward()
+                    optimizer.step()
+                    t.set_postfix(loss=loss.item())
+                    
+            scheduler.step()
 
     def predict(self, data):
         self.clf.eval()
@@ -130,6 +137,21 @@ class Net:
                 prob = F.softmax(out, dim=1)
                 probs[idxs] = prob.cpu()  # Ensure correct shape match
         return probs
+
+    def predict_prob_dropout(self, data, n_drop=10):
+        self.clf.train()  # Enable dropout layers during evaluation
+        probs = torch.zeros([len(data), self.params['n_classes']])
+        loader = DataLoader(data, shuffle=False, **self.params['test_args'])
+        for _ in range(n_drop):
+            with torch.no_grad():
+                for x, _, idxs in loader:
+                    x = x.to(self.device)
+                    out, _ = self.clf(x)
+                    prob = F.softmax(out, dim=1)
+                    probs[idxs] += prob.cpu()
+        probs /= n_drop  # Average over the number of stochastic forward passes
+        return probs
+
 
     # Other networks (MNIST_Net, SVHN_Net, CIFAR10_Net, CIFAR100_Net) remain the same
 class MNIST_Net(nn.Module):
