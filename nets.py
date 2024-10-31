@@ -34,16 +34,19 @@ class ResNet(nn.Module):
     def __init__(self, block, num_blocks, num_classes=100):
         super(ResNet, self).__init__()
         self.in_planes = 64
+        self.num_classes = num_classes
+
         self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(64)
         self.layer1 = self._make_layer(block, 64, num_blocks[0], stride=1)
         self.layer2 = self._make_layer(block, 128, num_blocks[1], stride=2)
         self.layer3 = self._make_layer(block, 256, num_blocks[2], stride=2)
         self.layer4 = self._make_layer(block, 512, num_blocks[3], stride=2)
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.linear = nn.Linear(512, num_classes)
 
     def _make_layer(self, block, planes, num_blocks, stride):
-        strides = [stride] + [1] * (num_blocks - 1)
+        strides = [stride] + [1]*(num_blocks - 1)
         layers = []
         for stride in strides:
             layers.append(block(self.in_planes, planes, stride))
@@ -51,15 +54,16 @@ class ResNet(nn.Module):
         return nn.Sequential(*layers)
 
     def forward(self, x):
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.layer1(out)
-        out = self.layer2(out)
-        out = self.layer3(out)
-        out = self.layer4(out)
-        out = F.avg_pool2d(out, 4)
-        out = out.view(out.size(0), -1)
-        e1 = self.linear(out)
-        return e1, out  # return embedding for compatibility with current structure
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        x = self.avgpool(x)
+        out = x.view(x.size(0), -1)
+        e1 = out
+        out = self.linear(out)
+        return out, e1  # return embedding for compatibility with current structure
 
     def get_embedding_dim(self):
         return 512
@@ -67,16 +71,16 @@ class ResNet(nn.Module):
 def ResNet18(num_classes=100):
     return ResNet(BasicBlock, [2, 2, 2, 2], num_classes)
 
-
 class Net:
-    def __init__(self, net, params, device):
-        self.net = net
+    def __init__(self, net_cls, params, device):
+        self.net_cls = net_cls
         self.params = params
         self.device = device
 
     def train(self, data):
         n_epoch = self.params['n_epoch']
-        self.clf = self.net().to(self.device)
+        num_classes = self.params['num_classes']
+        self.clf = self.net_cls(num_classes=num_classes).to(self.device)
         self.clf.train()
         optimizer = optim.SGD(self.clf.parameters(), **self.params['optimizer_args'])
         scheduler = StepLR(optimizer, step_size=5, gamma=0.5)
@@ -87,17 +91,17 @@ class Net:
                 for batch_idx, (x, y, idxs) in enumerate(t):
                     x, y = x.to(self.device), y.to(self.device)
                     optimizer.zero_grad()
-                    out, _ = self.clf(x)  # we don't need embedding in training
+                    out, _ = self.clf(x)
                     loss = F.cross_entropy(out, y)
                     loss.backward()
                     optimizer.step()
                     t.set_postfix(loss=loss.item())
-                    
+
             scheduler.step()
 
     def predict(self, data):
         self.clf.eval()
-        preds = torch.zeros(len(data), dtype=data.Y.dtype)
+        preds = torch.zeros(len(data), dtype=torch.long)
         loader = DataLoader(data, shuffle=False, **self.params['test_args'])
         with torch.no_grad():
             for x, y, idxs in loader:
@@ -107,61 +111,55 @@ class Net:
                 preds[idxs] = pred.cpu()
         return preds
 
-    # Original predict_prob function (commented out)
-    # def predict_prob(self, data):
-    #     self.clf.eval()
-    #     probs = torch.zeros([len(data), len(np.unique(data.Y))])  # Static shape, causes issues with changing class counts
-    #     loader = DataLoader(data, shuffle=False, **self.params['test_args'])
-    #     with torch.no_grad():
-    #         for x, y, idxs in loader:
-    #             x, y = x.to(self.device), y.to(self.device)
-    #             out, e1 = self.clf(x)
-    #             prob = F.softmax(out, dim=1)
-    #             probs[idxs] = prob.cpu()  # Fixed shape caused mismatch here
-    #     return probs
-
-    # Updated predict_prob function to handle dynamic number of classes
     def predict_prob(self, data):
         self.clf.eval()
-        
-        # Determine the number of classes dynamically
-        num_classes = self.clf.linear.out_features  # Get number of output classes from model
-
-        probs = torch.zeros([len(data), num_classes])  # Adjust shape based on current number of classes
+        num_classes = self.params['num_classes']
+        probs = torch.zeros([len(data), num_classes])
         loader = DataLoader(data, shuffle=False, **self.params['test_args'])
-        
         with torch.no_grad():
             for x, y, idxs in loader:
-                x, y = x.to(self.device), y.to(self.device)
+                x = x.to(self.device)
                 out, _ = self.clf(x)
                 prob = F.softmax(out, dim=1)
-                probs[idxs] = prob.cpu()  # Ensure correct shape match
+                probs[idxs] = prob.cpu()
         return probs
 
     def predict_prob_dropout(self, data, n_drop=10):
-        self.clf.train()  # Enable dropout layers during evaluation
-        probs = torch.zeros([len(data), self.params['n_classes']])
+        self.clf.train()  # Enable dropout layers
+        num_classes = self.params['num_classes']
+        probs = torch.zeros([len(data), num_classes])
         loader = DataLoader(data, shuffle=False, **self.params['test_args'])
         for _ in range(n_drop):
             with torch.no_grad():
-                for x, _, idxs in loader:
+                for x, y, idxs in loader:
                     x = x.to(self.device)
                     out, _ = self.clf(x)
                     prob = F.softmax(out, dim=1)
                     probs[idxs] += prob.cpu()
-        probs /= n_drop  # Average over the number of stochastic forward passes
+        probs /= n_drop
         return probs
 
+    def get_embeddings(self, data):
+        self.clf.eval()
+        embeddings = torch.zeros([len(data), self.clf.get_embedding_dim()])
+        loader = DataLoader(data, shuffle=False, **self.params['test_args'])
+        with torch.no_grad():
+            for x, y, idxs in loader:
+                x = x.to(self.device)
+                _, e1 = self.clf(x)
+                embeddings[idxs] = e1.cpu()
+        return embeddings
 
-    # Other networks (MNIST_Net, SVHN_Net, CIFAR10_Net, CIFAR100_Net) remain the same
+# Define other networks similarly, adding num_classes as a parameter
+
 class MNIST_Net(nn.Module):
-    def __init__(self):
+    def __init__(self, num_classes=10):
         super(MNIST_Net, self).__init__()
         self.conv1 = nn.Conv2d(1, 10, kernel_size=5)
         self.conv2 = nn.Conv2d(10, 20, kernel_size=5)
         self.conv2_drop = nn.Dropout2d()
         self.fc1 = nn.Linear(320, 50)
-        self.fc2 = nn.Linear(50, 10)
+        self.fc2 = nn.Linear(50, num_classes)
 
     def forward(self, x):
         x = F.relu(F.max_pool2d(self.conv1(x), 2))
@@ -176,71 +174,52 @@ class MNIST_Net(nn.Module):
         return 50
 
 class SVHN_Net(nn.Module):
-    def __init__(self):
+    def __init__(self, num_classes=10):
         super(SVHN_Net, self).__init__()
-        self.conv1 = nn.Conv2d(3, 32, kernel_size=3)
-        self.conv2 = nn.Conv2d(32, 32, kernel_size=3)
-        self.conv3 = nn.Conv2d(32, 32, kernel_size=3)
-        self.conv3_drop = nn.Dropout2d()
-        self.fc1 = nn.Linear(1152, 400)
-        self.fc2 = nn.Linear(400, 50)
-        self.fc3 = nn.Linear(50, 10)
+        self.conv1 = nn.Conv2d(3, 32, kernel_size=5, padding=2)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=5, padding=2)
+        self.conv2_drop = nn.Dropout2d()
+        self.fc1 = nn.Linear(64 * 8 * 8, 256)
+        self.fc2 = nn.Linear(256, num_classes)
 
     def forward(self, x):
-        x = F.relu(self.conv1(x))
-        x = F.relu(F.max_pool2d(self.conv2(x), 2))
-        x = F.relu(F.max_pool2d(self.conv3_drop(self.conv3(x)), 2))
-        x = x.view(-1, 1152)
-        x = F.relu(self.fc1(x))
-        e1 = F.relu(self.fc2(x))
+        x = F.relu(F.max_pool2d(self.conv1(x), 2))
+        x = F.relu(F.max_pool2d(self.conv2_drop(self.conv2(x)), 2))
+        x = x.view(-1, 64 * 8 * 8)
+        e1 = F.relu(self.fc1(x))
         x = F.dropout(e1, training=self.training)
-        x = self.fc3(x)
+        x = self.fc2(x)
         return x, e1
 
     def get_embedding_dim(self):
-        return 50
+        return 256
 
 class CIFAR10_Net(nn.Module):
-    def __init__(self):
+    def __init__(self, num_classes=10):
         super(CIFAR10_Net, self).__init__()
-        self.conv1 = nn.Conv2d(3, 32, kernel_size=5)
-        self.conv2 = nn.Conv2d(32, 32, kernel_size=5)
-        self.conv3 = nn.Conv2d(32, 64, kernel_size=5)
-        self.fc1 = nn.Linear(1024, 50)
-        self.fc2 = nn.Linear(50, 10)
+        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, padding=1)
+        self.conv1_bn = nn.BatchNorm2d(32)
+        self.conv2 = nn.Conv2d(32, 32, kernel_size=3, padding=1)
+        self.conv2_bn = nn.BatchNorm2d(32)
+        self.conv3 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+        self.conv3_bn = nn.BatchNorm2d(64)
+        self.conv4 = nn.Conv2d(64, 64, kernel_size=3, padding=1)
+        self.conv4_bn = nn.BatchNorm2d(64)
+        self.fc1 = nn.Linear(64 * 8 * 8, 512)
+        self.fc2 = nn.Linear(512, num_classes)
 
     def forward(self, x):
-        x = F.relu(self.conv1(x))
-        x = F.relu(F.max_pool2d(self.conv2(x), 2))
-        x = F.relu(F.max_pool2d(self.conv3(x), 2))
-        x = x.view(-1, 1024)
+        x = F.relu(self.conv1_bn(self.conv1(x)))
+        x = F.relu(self.conv2_bn(self.conv2(x)))
+        x = F.max_pool2d(x, 2)
+        x = F.relu(self.conv3_bn(self.conv3(x)))
+        x = F.relu(self.conv4_bn(self.conv4(x)))
+        x = F.max_pool2d(x, 2)
+        x = x.view(-1, 64 * 8 * 8)
         e1 = F.relu(self.fc1(x))
-        x = F.dropout(e1, training=self.training)
-        x = self.fc2(x)
+        x = self.fc2(e1)
         return x, e1
 
     def get_embedding_dim(self):
-        return 50
-
-class CIFAR100_Net(nn.Module):
-    def __init__(self):
-        super(CIFAR100_Net, self).__init__()
-        self.conv1 = nn.Conv2d(3, 32, kernel_size=5)
-        self.conv2 = nn.Conv2d(32, 32, kernel_size=5)
-        self.conv3 = nn.Conv2d(32, 64, kernel_size=5)
-        self.fc1 = nn.Linear(1024, 50)
-        self.fc2 = nn.Linear(50, 100)
-
-    def forward(self, x):
-        x = F.relu(self.conv1(x))
-        x = F.relu(F.max_pool2d(self.conv2(x), 2))
-        x = F.relu(F.max_pool2d(self.conv3(x), 2))
-        x = x.view(-1, 1024)
-        e1 = F.relu(self.fc1(x))
-        x = F.dropout(e1, training=self.training)
-        x = self.fc2(x)
-        return x, e1
-
-    def get_embedding_dim(self):
-        return 50
+        return 512
 

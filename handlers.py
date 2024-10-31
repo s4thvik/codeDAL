@@ -14,7 +14,7 @@ class MNIST_Handler(Dataset):
 
     def __getitem__(self, index):
         x, y = self.X[index], self.Y[index]
-        x = Image.fromarray(x.numpy(), mode='L')
+        x = Image.fromarray(x.numpy(), mode='L')  # Ensure correct data type
         x = self.transform(x)
         return x, y, index
 
@@ -27,12 +27,14 @@ class SVHN_Handler(Dataset):
         self.Y = Y
         self.transform = transforms.Compose([
             transforms.ToTensor(),
-            transforms.Normalize((0.4377, 0.4438, 0.4728), (0.1980, 0.2010, 0.1970))
+            transforms.Normalize((0.4377, 0.4438, 0.4728),
+                                 (0.1980, 0.2010, 0.1970))
         ])
 
     def __getitem__(self, index):
         x, y = self.X[index], self.Y[index]
-        x = Image.fromarray(np.transpose(x, (1, 2, 0)))
+        x = np.transpose(x, (1, 2, 0))  # SVHN images are (C, H, W), transpose to (H, W, C)
+        x = Image.fromarray(x)
         x = self.transform(x)
         return x, y, index
 
@@ -44,8 +46,11 @@ class CIFAR10_Handler(Dataset):
         self.X = X
         self.Y = Y
         self.transform = transforms.Compose([
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
-            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616))
+            transforms.Normalize((0.4914, 0.4822, 0.4465),
+                                 (0.2023, 0.1994, 0.2010))
         ])
 
     def __getitem__(self, index):
@@ -57,23 +62,6 @@ class CIFAR10_Handler(Dataset):
     def __len__(self):
         return len(self.X)
 
-#class CIFAR100_Handler(Dataset):
-#    def __init__(self, X, Y):
-#        self.X = X
-#        self.Y = Y
-#        self.transform = transforms.Compose([
-#            transforms.ToTensor(),
-#            transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761))
-#        ])
-#
-#    def __getitem__(self, index):
-#        x, y = self.X[index], self.Y[index]
-#        x = Image.fromarray(x)
-#        x = self.transform(x)
-#        return x, y, index
-#
-#    def __len__(self):
-#        return len(self.X)
 class CIFAR100_Handler(Dataset):
     def __init__(self, X, Y):
         self.X = X
@@ -82,14 +70,16 @@ class CIFAR100_Handler(Dataset):
             transforms.RandomCrop(32, padding=4),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
-            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
+            transforms.Normalize((0.5071, 0.4867, 0.4408),
+                                 (0.2675, 0.2565, 0.2761))
         ])
 
     def __getitem__(self, index):
         x, y = self.X[index], self.Y[index]
-        x = Image.fromarray(x)  # Convert numpy array to PIL image
+        x = Image.fromarray(x)
         x = self.transform(x)
         return x, y, index
 
     def __len__(self):
         return len(self.X)
+

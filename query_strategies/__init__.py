@@ -1,3 +1,4 @@
+from .strategy import Strategy
 from .random_sampling import RandomSampling
 from .least_confidence import LeastConfidence
 from .margin_sampling import MarginSampling
@@ -10,3 +11,4 @@ from .kcenter_greedy import KCenterGreedy
 from .bayesian_active_learning_disagreement_dropout import BALDDropout
 from .adversarial_bim import AdversarialBIM
 from .adversarial_deepfool import AdversarialDeepFool
+
