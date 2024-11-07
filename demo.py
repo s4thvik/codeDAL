@@ -1,17 +1,20 @@
+# demo.py
 import argparse
 import numpy as np
 import torch
+import torch.nn as nn
 from pprint import pprint
-
-# Assuming utils.py provides the following functions
-from utils import get_dataset, get_net, get_strategy
+from utils import get_dataset, get_net, get_strategy, params
+from torch.linalg import matrix_rank
+from sklearn.metrics import classification_report
+from nets import ContinualBackpropNet
 
 # Initialize the argument parser
 parser = argparse.ArgumentParser()
 parser.add_argument('--seed', type=int, default=1, help="Random seed")
-parser.add_argument('--n_init_labeled', type=int, default=10000, help="Initial labeled samples")  # Increased to 10,000
-parser.add_argument('--n_query', type=int, default=2000, help="Number of queries per round")      # Increased to 2,000
-parser.add_argument('--n_round', type=int, default=10, help="Number of rounds/tasks")
+parser.add_argument('--n_init_labeled', type=int, default=10000, help="Initial labeled samples")
+parser.add_argument('--n_query', type=int, default=2000, help="Number of queries per round")
+parser.add_argument('--n_round', type=int, default=10, help="Number of rounds")
 parser.add_argument('--dataset_name', type=str, default="CIFAR100",
                     choices=["CIFAR100", "CIFAR10", "SVHN", "MNIST"], help="Dataset")
 parser.add_argument('--strategy_name', type=str, default="EntropySampling",
@@ -22,160 +25,195 @@ parser.add_argument('--strategy_name', type=str, default="EntropySampling",
 args = parser.parse_args()
 args_dict = vars(args)
 
-# Display and log the arguments
 pprint(args_dict)
 print()
 
-# Open log files
-exp_log_file = open("exp_output.log", "w")
-summary_log_file = open("summary_output.txt", "w")
-
-# Log initial arguments to both files
-exp_log_file.write("Experiment Arguments:\n")
-summary_log_file.write("Experiment Arguments:\n")
-for arg, value in args_dict.items():
-    arg_str = f"{arg}: {value}\n"
-    exp_log_file.write(arg_str)
-    summary_log_file.write(arg_str)
-exp_log_file.write("\n")
-summary_log_file.write("\n")
-
-# Fix random seed for reproducibility
+# Set random seeds for reproducibility
 np.random.seed(args.seed)
 torch.manual_seed(args.seed)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
-# Use CUDA if available
-use_cuda = torch.cuda.is_available()
-device = torch.device("cuda" if use_cuda else "cpu")
+# Check for CUDA availability
+# Set up device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Load dataset and network
+# Initialize dataset, network, and strategy
 dataset = get_dataset(args.dataset_name)
-net = get_net(args.dataset_name, device)
+net_cls = get_net(args.dataset_name, device)  # Pass device parameter
+net = ContinualBackpropNet(
+    net_cls=net_cls,
+    params=params[args.dataset_name],  # Use params directly from utils
+    device=device,
+    replacement_rate=1e-4,
+    maturity_threshold=500,
+    decay_rate=0.9
+)
 strategy_class = get_strategy(args.strategy_name)
 strategy = strategy_class(dataset, net)
 
-# Initialize labeled and unlabeled pools
+# Initialize labeled data
 dataset.initialize_labels(args.n_init_labeled)
-initial_labeled = f"Initial labeled pool: {np.sum(dataset.labeled_idxs)}"
-unlabeled_pool = f"Unlabeled pool: {dataset.n_pool - np.sum(dataset.labeled_idxs)}"
-testing_pool = f"Testing pool: {dataset.n_test}"
 
-print(initial_labeled)
-print(unlabeled_pool)
-print(testing_pool)
-exp_log_file.write(f"{initial_labeled}\n{unlabeled_pool}\n{testing_pool}\n\n")
-summary_log_file.write(f"{initial_labeled}\n{unlabeled_pool}\n{testing_pool}\n\n")
+# Function to calculate percentage of dead units
+def calculate_dead_units(layer):
+    if isinstance(layer, nn.Linear):
+        # Calculate weight norms for each output unit
+        weight_norms = torch.norm(layer.weight, dim=1)  # [out_features]
+        
+        # Consider bias if it exists
+        if layer.bias is not None:
+            bias_contribution = torch.abs(layer.bias)
+            total_contribution = weight_norms + bias_contribution
+        else:
+            total_contribution = weight_norms
+        
+        # A unit is considered dead if its total contribution is near zero
+        dead_mask = total_contribution < 1e-6
+        return (dead_mask.sum().item() / layer.weight.size(0)) * 100
+    return 0
+# Function to calculate effective rank of a layer's weight matrix
+def calculate_effective_rank(layer):
+    if isinstance(layer, nn.Linear):
+        # SVD-based effective rank calculation
+        U, S, V = torch.svd(layer.weight.data)
+        normalized_singular_values = S / S.sum()
+        entropy = -(normalized_singular_values * torch.log(normalized_singular_values + 1e-10)).sum()
+        return torch.exp(entropy).item()
+    return 0
 
-# Track sample counts for each round
-current_labeled_count = np.sum(dataset.labeled_idxs)
+# Initialize log files
+experiment_log = open("exp_output.log", "w")
+summary_log = open("summary_output.txt", "w")
 
-# Round 0 training and logging
+# Function to track class distribution
+def track_class_distribution(dataset, query_idxs, round_num):
+    new_classes = dataset.Y_train[query_idxs]
+    class_counts = np.bincount(new_classes, minlength=dataset.num_classes)
+    
+    # Create distribution string
+    dist_str = f"\nClass Distribution for Round {round_num}:\n"
+    dist_str += "-" * 40 + "\n"
+    for class_idx, count in enumerate(class_counts):
+        if count > 0:
+            dist_str += f"Class {class_idx:3d}: {count:4d} samples\n"
+    dist_str += "-" * 40 + "\n"
+    return dist_str, class_counts
+
+# Function to log statistics
+def log_statistics(round_num, loss, acc, per_class_acc, dead_units, avg_dead_units, 
+                  avg_weight_magnitude, avg_effective_rank, new_labeled, total_labeled, class_dist_str=None):
+    log_entry = f"Round {round_num}:\n"
+    if loss is not None:
+        log_entry += f"  Average Loss: {loss:.4f}\n"
+    log_entry += f"  Testing Accuracy: {acc:.4f}\n"
+    
+    # Add class distribution if available
+    if class_dist_str:
+        log_entry += class_dist_str
+    
+    log_entry += f"  Per-Class Accuracy:\n"
+    for cls, metrics in per_class_acc.items():
+        if isinstance(metrics, dict):
+            log_entry += f"    Class {cls}: Precision: {metrics['precision']:.4f}, "
+            log_entry += f"Recall: {metrics['recall']:.4f}, F1-Score: {metrics['f1-score']:.4f}\n"
+    
+    log_entry += f"  Network Statistics:\n"
+    log_entry += f"    Avg Weight Magnitude: {avg_weight_magnitude:.4f}\n"
+    log_entry += f"    Percentage of Dead Units: {avg_dead_units:.2f}%\n"
+    log_entry += f"    Effective Rank: {avg_effective_rank:.2f}\n"
+    log_entry += f"  Sample Statistics:\n"
+    log_entry += f"    New Labeled Samples: {new_labeled}\n"
+    log_entry += f"    Total Labeled Samples: {total_labeled}\n\n"
+
+    print(log_entry)
+    experiment_log.write(log_entry)
+    summary_log.write(log_entry)
+
+# Round 0 training
 print("Round 0")
-exp_log_file.write("Round 0\n")
+loss_round_0 = strategy.train()
+preds = strategy.predict(dataset.get_test_data())
+round_0_accuracy = dataset.cal_test_acc(preds)
+per_class_acc = classification_report(dataset.Y_test, preds, output_dict=True, zero_division=0)
 
-# Update the model with the initial seen classes
-net.update_seen_classes([dataset.class_to_idx[cls] for cls in dataset.get_seen_classes()])
+# Calculate initial statistics
+dead_units = sum(calculate_dead_units(layer) for layer in net.clf.model.children() if isinstance(layer, nn.Linear))
+avg_dead_units = dead_units / len([layer for layer in net.clf.model.children() if isinstance(layer, nn.Linear)])
+avg_weight_magnitude = sum(layer.weight.abs().mean().item() for layer in net.clf.model.children() if isinstance(layer, nn.Linear)) / len([layer for layer in net.clf.model.children() if isinstance(layer, nn.Linear)])
+avg_effective_rank = sum(calculate_effective_rank(layer) for layer in net.clf.model.children() if isinstance(layer, nn.Linear)) / len([layer for layer in net.clf.model.children() if isinstance(layer, nn.Linear)])
 
-strategy.train()
+new_labeled = args.n_init_labeled
+total_labeled = args.n_init_labeled
 
-# Calculate accuracy on seen classes
-seen_classes = dataset.get_seen_classes()
-test_data = dataset.get_test_data(seen_classes=seen_classes)
-preds = strategy.predict(test_data)
-preds = preds.numpy()
-round_0_accuracy = dataset.cal_test_acc(preds, seen_classes=seen_classes)
-round_0_log = f"Round 0 Testing Accuracy on Seen Classes: {round_0_accuracy:.4f}"
-print(round_0_log)
-exp_log_file.write(f"{round_0_log}\n")
-summary_log_file.write(f"{round_0_log}\n")
+# Track initial class distribution
+dist_str, _ = track_class_distribution(dataset, np.where(dataset.labeled_idxs)[0], 0)
 
-# Initialize statistics tracking
-accuracies = [round_0_accuracy]
-per_class_accuracies = []
-forgetting = []
+log_statistics(
+    round_num=0,
+    loss=loss_round_0,
+    acc=round_0_accuracy,
+    per_class_acc=per_class_acc,
+    dead_units=dead_units,
+    avg_dead_units=avg_dead_units,
+    avg_weight_magnitude=avg_weight_magnitude,
+    avg_effective_rank=avg_effective_rank,
+    new_labeled=new_labeled,
+    total_labeled=total_labeled,
+    class_dist_str=dist_str
+)
 
-# Compute per-class accuracy for round 0
-from sklearn.metrics import confusion_matrix
-
-test_labels = test_data.Y
-num_classes = len(seen_classes)
-cm = confusion_matrix(test_labels, preds, labels=range(num_classes))
-with np.errstate(divide='ignore', invalid='ignore'):
-    class_acc = np.true_divide(cm.diagonal(), cm.sum(axis=1))
-    class_acc[cm.sum(axis=1) == 0] = 0
-per_class_accuracies.append(class_acc)
-
-# Continual learning over rounds/tasks
+# Active learning rounds
 for rd in range(1, args.n_round + 1):
-    round_start = f"Round {rd}"
-    print(round_start)
-    exp_log_file.write(f"{round_start}\n")
-
-    # Update dataset to include the next set of classes (no new samples are labeled here)
-    dataset.update_task_classes()
-
-    # Update the model with the current seen classes
-    net.update_seen_classes([dataset.class_to_idx[cls] for cls in dataset.get_seen_classes()])
-
-    # Active learning query for new labeled samples
+    print(f"Round {rd}")
     query_idxs = strategy.query(args.n_query)
     strategy.update(query_idxs)
+    
+    # Track class distribution before training
+    dist_str, _ = track_class_distribution(dataset, query_idxs, rd)
+    
+    loss = strategy.train()
+    preds = strategy.predict(dataset.get_test_data())
+    round_accuracy = dataset.cal_test_acc(preds)
+    per_class_acc = classification_report(dataset.Y_test, preds, output_dict=True, zero_division=0)
+    
+    # Calculate statistics
+    dead_units = sum(calculate_dead_units(layer) for layer in net.clf.model.children() if isinstance(layer, nn.Linear))
+    avg_dead_units = dead_units / len([layer for layer in net.clf.model.children() if isinstance(layer, nn.Linear)])
+    avg_weight_magnitude = sum(layer.weight.abs().mean().item() for layer in net.clf.model.children() if isinstance(layer, nn.Linear)) / len([layer for layer in net.clf.model.children() if isinstance(layer, nn.Linear)])
+    avg_effective_rank = sum(calculate_effective_rank(layer) for layer in net.clf.model.children() if isinstance(layer, nn.Linear)) / len([layer for layer in net.clf.model.children() if isinstance(layer, nn.Linear)])
 
-    # Verify total labeled samples
-    current_labeled_count = np.sum(dataset.labeled_idxs)
-    current_unlabeled_count = dataset.n_pool - current_labeled_count
+    new_labeled = len(query_idxs)
+    total_labeled += new_labeled
 
-    # Log sample count details
-    sample_log = (f"Round {rd} Sample Stats - Total Labeled: {current_labeled_count}, "
-                  f"Newly Labeled: {len(query_idxs)}, Unlabeled: {current_unlabeled_count}")
-    print(sample_log)
-    exp_log_file.write(f"{sample_log}\n")
-    summary_log_file.write(f"{sample_log}\n")
-
-    # Retrain on new combined labeled data
-    strategy.train()
-
-    # Calculate accuracy on seen classes
-    seen_classes = dataset.get_seen_classes()
-    test_data = dataset.get_test_data(seen_classes=seen_classes)
-    preds = strategy.predict(test_data)
-    preds = preds.numpy()
-    round_accuracy = dataset.cal_test_acc(preds, seen_classes=seen_classes)
-    round_log = f"Round {rd} Testing Accuracy on Seen Classes: {round_accuracy:.4f}"
-    print(round_log)
-    exp_log_file.write(f"{round_log}\n")
-    summary_log_file.write(f"{round_log}\n")
-
-    accuracies.append(round_accuracy)
-
-    # Compute per-class accuracy
-    num_classes = len(seen_classes)
-    cm = confusion_matrix(test_data.Y, preds, labels=range(num_classes))
-    with np.errstate(divide='ignore', invalid='ignore'):
-        class_acc = np.true_divide(cm.diagonal(), cm.sum(axis=1))
-        class_acc[cm.sum(axis=1) == 0] = 0
-    per_class_accuracies.append(class_acc)
-
-    # Compute forgetting
-    if rd > 1:
-        prev_class_acc = per_class_accuracies[-2]
-        current_class_acc = class_acc
-        forgetting_per_class = prev_class_acc - current_class_acc
-        forgetting.append(forgetting_per_class)
-        # Log forgetting
-        forgetting_log = f"Round {rd} Forgetting per class: {forgetting_per_class}"
-        print(forgetting_log)
-        exp_log_file.write(f"{forgetting_log}\n")
-        summary_log_file.write(f"{forgetting_log}\n")
-
-exp_log_file.write("Experiment log complete.\n")
-summary_log_file.write("Summary log complete.\n")
+    log_statistics(
+        round_num=rd,
+        loss=loss,
+        acc=round_accuracy,
+        per_class_acc=per_class_acc,
+        dead_units=dead_units,
+        avg_dead_units=avg_dead_units,
+        avg_weight_magnitude=avg_weight_magnitude,
+        avg_effective_rank=avg_effective_rank,
+        new_labeled=new_labeled,
+        total_labeled=total_labeled,
+        class_dist_str=dist_str
+    )
 
 # Close log files
-exp_log_file.close()
-summary_log_file.close()
+experiment_log.close()
+summary_log.close()
 
 print("Experiment complete. Check 'exp_output.log' for detailed logs and 'summary_output.txt' for summary.")
+
+
+
+
+
+
+
+
+
+
+
 
