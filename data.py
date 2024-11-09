@@ -16,6 +16,15 @@ class Data:
         self.n_test = len(X_test)
         self.labeled_idxs = np.zeros(self.n_pool, dtype=bool)
         self.num_classes = len(np.unique(Y_train))
+    
+    def get_train_data(self):
+        """Get training data with current labeled indices"""
+        labeled_idxs = np.arange(self.n_pool)[self.labeled_idxs]
+        return self.handler(
+            self.X_train[labeled_idxs], 
+            self.Y_train[labeled_idxs],
+            train=True
+        )
 
     def initialize_labels(self, num):
         # Calculate samples per class for initial uniform sampling
@@ -89,4 +98,5 @@ def get_CIFAR10(handler):
                 data_test.data, np.array(data_test.targets), handler)
 
 
-#hi3
+#hi4
+

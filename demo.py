@@ -9,8 +9,9 @@ from torch.linalg import matrix_rank
 from sklearn.metrics import classification_report
 from nets import ContinualBackpropNet
 from torch.utils.data import DataLoader
+from data import Data
 
-# Initialize the argument parser
+# Initialize the argument parser first
 parser = argparse.ArgumentParser()
 parser.add_argument('--seed', type=int, default=1, help="Random seed")
 parser.add_argument('--n_init_labeled', type=int, default=10000, help="Initial labeled samples")
@@ -23,11 +24,13 @@ parser.add_argument('--strategy_name', type=str, default="EntropySampling",
                              "LeastConfidenceDropout", "MarginSamplingDropout", "EntropySamplingDropout",
                              "KMeansSampling", "KCenterGreedy", "BALDDropout", "AdversarialBIM",
                              "AdversarialDeepFool"], help="Query strategy")
+
 args = parser.parse_args()
 args_dict = vars(args)
-
 pprint(args_dict)
-print()
+
+# Then initialize dataset, network, and strategy
+dataset = get_dataset(args.dataset_name)
 
 # Set random seeds for reproducibility
 np.random.seed(args.seed)
@@ -191,20 +194,10 @@ for rd in range(1, args.n_round + 1):
     query_idxs = strategy.query(args.n_query)
     strategy.update(query_idxs)
     
-    # Create train loader for this round
-    train_loader = DataLoader(
-        dataset.get_train_data(),
-        **params[args.dataset_name]['train_args']
-    )
+    # Train for this round
+    loss = strategy.train()
     
-    # Train with utility tracking
-    total_loss = 0
-    for epoch in range(params[args.dataset_name]['n_epoch']):
-        for x, y, idxs in train_loader:
-            loss, output, features = strategy.net.train_on_batch(x, y)
-            total_loss += loss.item()
-    
-    loss = total_loss / len(train_loader)
+    # Get predictions and calculate metrics
     preds = strategy.predict(dataset.get_test_data())
     round_accuracy = dataset.cal_test_acc(preds)
     per_class_acc = classification_report(dataset.Y_test, preds, output_dict=True, zero_division=0)
@@ -256,4 +249,4 @@ def track_plasticity_metrics(self):
     return metrics
 
 
-#hi2
+#hi5

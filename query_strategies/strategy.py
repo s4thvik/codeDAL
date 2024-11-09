@@ -41,8 +41,8 @@ class Strategy:
 
     def train(self):
         labeled_idxs, labeled_data = self.dataset.get_labeled_data()
-        loss = self.net.train_model(labeled_data)
-        return loss  # Return the average loss
+        loss, metrics = self.net.train_model(labeled_data)
+        return loss, metrics
 
     def predict(self, data):
         preds = self.net.predict(data)
@@ -63,7 +63,5 @@ class Strategy:
     def get_embeddings(self, data):
         embeddings = self.net.get_embeddings(data)
         return embeddings
-
-
 
 
