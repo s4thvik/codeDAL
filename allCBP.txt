@@ -1,0 +1,572 @@
+this is all about continual back propagation, these codes are from a different project.
+this is cbp.py :
+from torch import optim
+from lop.algos.gnt import GnT
+from lop.utils.AdamGnT import AdamGnT
+import torch.nn.functional as F
+
+
+class ContinualBackprop(object):
+    """
+    The Continual Backprop algorithm, used in https://arxiv.org/abs/2108.06325v3
+    """
+    def __init__(
+            self,
+            net,
+            step_size=0.001,
+            loss='mse',
+            opt='sgd',
+            beta=0.9,
+            beta_2=0.999,
+            replacement_rate=0.001,
+            decay_rate=0.9,
+            device='cpu',
+            maturity_threshold=100,
+            util_type='contribution',
+            init='kaiming',
+            accumulate=False,
+            momentum=0,
+            outgoing_random=False,
+            weight_decay=0
+    ):
+        self.net = net
+
+        # define the optimizer
+        if opt == 'sgd':
+            self.opt = optim.SGD(self.net.parameters(), lr=step_size, momentum=momentum, weight_decay=weight_decay)
+        elif opt == 'adam':
+            self.opt = AdamGnT(self.net.parameters(), lr=step_size, betas=(beta, beta_2), weight_decay=weight_decay)
+
+        # define the loss function
+        self.loss_func = {'nll': F.cross_entropy, 'mse': F.mse_loss}[loss]
+
+        # a placeholder
+        self.previous_features = None
+
+        # define the generate-and-test object for the given network
+        self.gnt = None
+        self.gnt = GnT(
+            net=self.net.layers,
+            hidden_activation=self.net.act_type,
+            opt=self.opt,
+            replacement_rate=replacement_rate,
+            decay_rate=decay_rate,
+            maturity_threshold=maturity_threshold,
+            util_type=util_type,
+            device=device,
+            loss_func=self.loss_func,
+            init=init,
+            accumulate=accumulate,
+        )
+
+    def learn(self, x, target):
+        """
+        Learn using one step of gradient-descent and generate-&-test
+        :param x: input
+        :param target: desired output
+        :return: loss
+        """
+        # do a forward pass and get the hidden activations
+        output, features = self.net.predict(x=x)
+        loss = self.loss_func(output, target)
+        self.previous_features = features
+
+        # do the backward pass and take a gradient step
+        self.opt.zero_grad()
+        loss.backward()
+        self.opt.step()
+
+        # take a generate-and-test step
+        self.opt.zero_grad()
+        if type(self.gnt) is GnT:
+            self.gnt.gen_and_test(features=self.previous_features)
+
+        if self.loss_func == F.cross_entropy:
+            return loss.detach(), output.detach()
+
+        return loss.detach()
+
+
+this is cbp_conv.py : 
+import torch
+from torch import nn
+from torch.nn.init import calculate_gain
+from lop.algos.cbp_linear import call_reinit, log_features, get_layer_bound
+
+
+class CBPConv(nn.Module):
+    def __init__(
+            self,
+            in_layer: nn.Conv2d,
+            out_layer: [nn.Conv2d, nn.Linear],
+            ln_layer: nn.LayerNorm = None,
+            bn_layer: nn.BatchNorm2d = None,
+            num_last_filter_outputs=1,
+            replacement_rate=1e-5,
+            maturity_threshold=1000,
+            init='kaiming',
+            act_type='relu',
+            util_type='contribution',
+            decay_rate=0,
+    ):
+        super().__init__()
+        if type(in_layer) is not nn.Conv2d:
+            raise Warning("Make sure in_layer is a convolutional layer")
+        if type(out_layer) not in [nn.Linear, nn.Conv2d]:
+            raise Warning("Make sure out_layer is a convolutional or linear layer")
+
+        """
+        Define the hyper-parameters of the algorithm
+        """
+        self.replacement_rate = replacement_rate
+        self.maturity_threshold = maturity_threshold
+        self.util_type = util_type
+        self.decay_rate = decay_rate
+        self.features = None
+        self.num_last_filter_outputs = num_last_filter_outputs
+
+        """
+        Register hooks
+        """
+        if self.replacement_rate > 0:
+            self.register_full_backward_hook(call_reinit)
+            self.register_forward_hook(log_features)
+
+        self.in_layer = in_layer
+        self.out_layer = out_layer
+        self.ln_layer = ln_layer
+        self.bn_layer = bn_layer
+        """
+        Utility of all features/neurons
+        """
+        self.util = nn.Parameter(torch.zeros(self.in_layer.out_channels), requires_grad=False)
+        self.ages = nn.Parameter(torch.zeros(self.in_layer.out_channels), requires_grad=False)
+        self.accumulated_num_features_to_replace = nn.Parameter(torch.zeros(1), requires_grad=False)
+        """
+        Calculate uniform distribution's bound for random feature initialization
+        """
+        self.bound = get_layer_bound(layer=self.in_layer, init=init, gain=calculate_gain(nonlinearity=act_type))
+
+    def forward(self, _input):
+        return _input
+
+    def get_features_to_reinit(self):
+        """
+        Returns: Features to replace
+        """
+        features_to_replace_input_indices = torch.empty(0, dtype=torch.long, device=self.util.device)
+        features_to_replace_output_indices = torch.empty(0, dtype=torch.long, device=self.util.device)
+        self.ages += 1
+        """
+        Calculate number of features to replace
+        """
+        eligible_feature_indices = torch.where(self.ages > self.maturity_threshold)[0]
+        if eligible_feature_indices.shape[0] == 0:  return features_to_replace_input_indices, features_to_replace_output_indices
+
+        num_new_features_to_replace = self.replacement_rate*eligible_feature_indices.shape[0]
+        self.accumulated_num_features_to_replace += num_new_features_to_replace
+        if self.accumulated_num_features_to_replace < 1:    return features_to_replace_input_indices, features_to_replace_output_indices
+
+        num_new_features_to_replace = int(self.accumulated_num_features_to_replace)
+        self.accumulated_num_features_to_replace -= num_new_features_to_replace
+        """
+        Calculate feature utility
+        """
+        if isinstance(self.out_layer, torch.nn.Linear):
+            output_weight_mag = self.out_layer.weight.data.abs().mean(dim=0).view(-1, self.num_last_filter_outputs)
+            self.util.data = (output_weight_mag * self.features.abs().mean(dim=0).view(-1, self.num_last_filter_outputs)).mean(dim=1)
+        elif isinstance(self.out_layer, torch.nn.Conv2d):
+            output_weight_mag = self.out_layer.weight.data.abs().mean(dim=(0, 2, 3))
+            self.util.data = output_weight_mag * self.features.abs().mean(dim=(0, 2, 3))
+        """
+        Find features with smallest utility
+        """
+        new_features_to_replace = torch.topk(-self.util[eligible_feature_indices], num_new_features_to_replace)[1]
+        new_features_to_replace = eligible_feature_indices[new_features_to_replace]
+        features_to_replace_input_indices, features_to_replace_output_indices = new_features_to_replace, new_features_to_replace
+
+        if isinstance(self.in_layer, torch.nn.Conv2d) and isinstance(self.out_layer, torch.nn.Linear):
+            features_to_replace_output_indices = (
+                    (new_features_to_replace * self.num_last_filter_outputs).repeat_interleave(self.num_last_filter_outputs) +
+                    torch.tensor([i for i in range(self.num_last_filter_outputs)]).repeat(new_features_to_replace.size()[0]))
+        return features_to_replace_input_indices, features_to_replace_output_indices
+
+    def reinit_features(self, features_to_replace_input_indices, features_to_replace_output_indices):
+        """
+        Reset input and output weights for low utility features
+        """
+        with torch.no_grad():
+            num_features_to_replace = features_to_replace_input_indices.shape[0]
+            if num_features_to_replace == 0: return
+            self.in_layer.weight.data[features_to_replace_input_indices, :] *= 0.0
+            # noinspection PyArgumentList
+            self.in_layer.weight.data[features_to_replace_input_indices, :] += \
+                torch.empty([num_features_to_replace] + list(self.in_layer.weight.shape[1:]), device=self.util.device).uniform_(-self.bound, self.bound)
+            self.in_layer.bias.data[features_to_replace_input_indices] *= 0
+
+            self.out_layer.weight.data[:, features_to_replace_output_indices] = 0
+            self.ages[features_to_replace_input_indices] = 0
+
+            """
+            Reset the corresponding batchnorm/layernorm layers
+            """
+            if self.bn_layer is not None:
+                self.bn_layer.bias.data[features_to_replace_input_indices] = 0.0
+                self.bn_layer.weight.data[features_to_replace_input_indices] = 1.0
+                self.bn_layer.running_mean.data[features_to_replace_input_indices] = 0.0
+                self.bn_layer.running_var.data[features_to_replace_input_indices] = 1.0
+            if self.ln_layer is not None:
+                self.ln_layer.bias.data[features_to_replace_input_indices] = 0.0
+                self.ln_layer.weight.data[features_to_replace_input_indices] = 1.0
+
+    def reinit(self):
+        """
+        Perform selective reinitialization
+        """
+        features_to_replace_input_indices, features_to_replace_output_indices = self.get_features_to_reinit()
+        self.reinit_features(features_to_replace_input_indices, features_to_replace_output_indices)
+
+
+this is cbp_linear.py : 
+import torch
+from torch import nn
+from math import sqrt
+
+
+def call_reinit(m, i, o):
+    m.reinit()
+
+
+def log_features(m, i, o):
+    with torch.no_grad():
+        if m.decay_rate == 0:
+            m.features = i[0]
+        else:
+            if m.features is None:
+                m.features = (1 - m.decay_rate) * i[0]
+            else:
+                m.features = m.features * m.decay_rate + (1 - m.decay_rate) * i[0]
+
+
+def get_layer_bound(layer, init, gain):
+    if isinstance(layer, nn.Conv2d):
+        return sqrt(1 / (layer.in_channels * layer.kernel_size[0] * layer.kernel_size[1]))
+    elif isinstance(layer, nn.Linear):
+        if init == 'default':
+            bound = sqrt(1 / layer.in_features)
+        elif init == 'xavier':
+            bound = gain * sqrt(6 / (layer.in_features + layer.out_features))
+        elif init == 'lecun':
+            bound = sqrt(3 / layer.in_features)
+        else:
+            bound = gain * sqrt(3 / layer.in_features)
+        return bound
+
+
+class CBPLinear(nn.Module):
+    def __init__(
+            self,
+            in_layer: nn.Linear,
+            out_layer: nn.Linear,
+            ln_layer: nn.LayerNorm = None,
+            bn_layer: nn.BatchNorm1d = None,
+            replacement_rate=1e-4,
+            maturity_threshold=100,
+            init='kaiming',
+            act_type='relu',
+            util_type='contribution',
+            decay_rate=0,
+    ):
+        super().__init__()
+        if type(in_layer) is not nn.Linear:
+            raise Warning("Make sure in_layer is a weight layer")
+        if type(out_layer) is not nn.Linear:
+            raise Warning("Make sure out_layer is a weight layer")
+        """
+        Define the hyper-parameters of the algorithm
+        """
+        self.replacement_rate = replacement_rate
+        self.maturity_threshold = maturity_threshold
+        self.util_type = util_type
+        self.decay_rate = decay_rate
+        self.features = None
+        """
+        Register hooks
+        """
+        if self.replacement_rate > 0:
+            self.register_full_backward_hook(call_reinit)
+            self.register_forward_hook(log_features)
+
+        self.in_layer = in_layer
+        self.out_layer = out_layer
+        self.ln_layer = ln_layer
+        self.bn_layer = bn_layer
+        """
+        Utility of all features/neurons
+        """
+        self.util = nn.Parameter(torch.zeros(self.in_layer.out_features), requires_grad=False)
+        self.ages = nn.Parameter(torch.zeros(self.in_layer.out_features), requires_grad=False)
+        self.accumulated_num_features_to_replace = nn.Parameter(torch.zeros(1), requires_grad=False)
+        """
+        Calculate uniform distribution's bound for random feature initialization
+        """
+        self.bound = get_layer_bound(layer=self.in_layer, init=init, gain=nn.init.calculate_gain(nonlinearity=act_type))
+
+    def forward(self, _input):
+        return _input
+
+    def get_features_to_reinit(self):
+        """
+        Returns: Features to replace
+        """
+        features_to_replace = torch.empty(0, dtype=torch.long, device=self.util.device)
+        self.ages += 1
+        """
+        Calculate number of features to replace
+        """
+        eligible_feature_indices = torch.where(self.ages > self.maturity_threshold)[0]
+        if eligible_feature_indices.shape[0] == 0:  return features_to_replace
+
+        num_new_features_to_replace = self.replacement_rate*eligible_feature_indices.shape[0]
+        self.accumulated_num_features_to_replace += num_new_features_to_replace
+        if self.accumulated_num_features_to_replace < 1:    return features_to_replace
+
+        num_new_features_to_replace = int(self.accumulated_num_features_to_replace)
+        self.accumulated_num_features_to_replace -= num_new_features_to_replace
+        """
+        Calculate feature utility
+        """
+        output_weight_mag = self.out_layer.weight.data.abs().mean(dim=0)
+        self.util.data = output_weight_mag * self.features.abs().mean(dim=[i for i in range(self.features.ndim - 1)])
+        """
+        Find features with smallest utility
+        """
+        new_features_to_replace = torch.topk(-self.util[eligible_feature_indices], num_new_features_to_replace)[1]
+        new_features_to_replace = eligible_feature_indices[new_features_to_replace]
+        features_to_replace = new_features_to_replace
+        return features_to_replace
+
+    def reinit_features(self, features_to_replace):
+        """
+        Reset input and output weights for low utility features
+        """
+        with torch.no_grad():
+            num_features_to_replace = features_to_replace.shape[0]
+            if num_features_to_replace == 0: return
+            self.in_layer.weight.data[features_to_replace, :] *= 0.0
+            self.in_layer.weight.data[features_to_replace, :] += \
+                torch.empty(num_features_to_replace, self.in_layer.in_features, device=self.util.device).uniform_(-self.bound, self.bound)
+            self.in_layer.bias.data[features_to_replace] *= 0
+
+            self.out_layer.weight.data[:, features_to_replace] = 0
+            self.ages[features_to_replace] = 0
+
+            """
+            Reset the corresponding batchnorm/layernorm layers
+            """
+            if self.bn_layer is not None:
+                self.bn_layer.bias.data[features_to_replace] = 0.0
+                self.bn_layer.weight.data[features_to_replace] = 1.0
+                self.bn_layer.running_mean.data[features_to_replace] = 0.0
+                self.bn_layer.running_var.data[features_to_replace] = 1.0
+            if self.ln_layer is not None:
+                self.ln_layer.bias.data[features_to_replace] = 0.0
+                self.ln_layer.weight.data[features_to_replace] = 1.0
+
+    def reinit(self):
+        """
+        Perform selective reinitialization
+        """
+        features_to_replace = self.get_features_to_reinit()
+        self.reinit_features(features_to_replace)
+
+
+this is cbpGnT.py : 
+from torch import optim
+from lop.algos.convGnT import ConvGnT
+import torch.nn.functional as F
+from lop.utils.AdamGnT import AdamGnT
+
+
+class ConvCBP(object):
+    """
+    The Continual Backprop algorithm
+    """
+    def __init__(self, net, step_size=0.001, loss='mse', opt='sgd', beta=0.9, beta_2=0.999, replacement_rate=0.0001,
+                 decay_rate=0.9, init='kaiming', util_type='contribution', maturity_threshold=100, device='cpu',
+                 momentum=0, weight_decay=0):
+        self.net = net
+
+        # define the optimizer
+        if opt == 'sgd':
+            self.opt = optim.SGD(self.net.parameters(), lr=step_size, momentum=momentum, weight_decay=weight_decay)
+        elif opt == 'adam':
+            self.opt = AdamGnT(self.net.parameters(), lr=step_size, betas=(beta, beta_2), weight_decay=weight_decay)
+
+        # define the loss function
+        self.loss_func = {'nll': F.cross_entropy, 'mse': F.mse_loss}[loss]
+
+        # a placeholder
+        self.previous_features = None
+
+        # define the generate-and-test object for the given network
+        self.gnt = ConvGnT(
+            net=self.net.layers,
+            hidden_activation=self.net.act_type,
+            opt=self.opt,
+            replacement_rate=replacement_rate,
+            decay_rate=decay_rate,
+            init=init,
+            num_last_filter_outputs=net.last_filter_output,
+            util_type=util_type,
+            maturity_threshold=maturity_threshold,
+            device=device,
+        )
+
+    def learn(self, x, target):
+        """
+        Learn using one step of gradient-descent and generate-&-test
+        :param x: input
+        :param target: desired output
+        :return: loss
+        """
+        # do a forward pass and get the hidden activations
+        output, features = self.net.predict(x=x)
+        loss = self.loss_func(output, target)
+        self.previous_features = features
+
+        # do the backward pass and take a gradient step
+        loss.backward()
+        self.opt.step()
+        self.opt.zero_grad()
+
+        # take a generate-and-test step
+        self.gnt.gen_and_test(features=self.previous_features)
+
+        return loss.detach(), output
+
+
+
+more data about continual back propagation : 
+We now attempt to develop a new algorithm that can fully mitigate loss of plasticity in continual
+learning problems as well as solve all three correlates of loss of plasticity. In the previous section, we
+learned that continual injection of randomness is important to reduce the loss of plasticity. However, the
+continual injection of randomness in the previous section was tied to the idea of shrinking the weights. There
+exists prior work [57] that proposed a more direct way of continually injecting randomness by selectively
+reinitializing low-utility units in the network. But the ideas presented in that paper were not fully developed
+and could only be used with neural networks with a single hidden layer and a single output, so they can
+not be used with modern deep learning in their current form. In this section, we fully develop the idea of
+selective reinitialization so it can be used with modern deep learning. The resulting algorithm combines
+conventional backpropagation with selective reinitialization. We call it continual backpropagation
+In one sense, continual backpropagation is a simple and natural extension of the conventional back￾propagation algorithm to continual learning. The conventional backpropagation algorithm has two main
+parts: initialization with small random weights and gradient descent at every time step. This algorithm
+is designed for the train-once setting, where learning happens once and never again. It only initializes the
+connections with small random numbers in the beginning, but continual backpropagation does so continually.
+Continual backpropagation makes conventional backpropagation continual by performing similar comp￾utations at all times. The guiding principle behind continual backpropagation is that good continual learning
+algorithms should do similar computations at all times.
+Continual backpropagation selectively reinitializes low-utility units in the network. Selective reinit￾ialization has two steps. The first step is to find low-utility units and the second is to reinitialize them.
+Every time step, a fraction of hidden units ρ, called replacement-rate, are reinitialized in every layer. When
+a new hidden unit is added, its outgoing weights are initialized to zero. Initializing the outgoing weights
+as zero ensures that the newly added hidden units do not affect the already learned function. However,
+initializing the outgoing weight to zero makes the new unit vulnerable to immediate reinitialized as it has
+zero utility. To protect new units from immediate reinitialization, they are protected from a reinitialization
+for maturity threshold m number of updates.
+One major limitation of prior work on selective reinitialization is that the utility measure is limited to
+networks with a single hidden layer and one output. We overcome this limitation by proposing a utility
+measure that can be applied to arbitrary networks. Our utility measure has two parts. The first part
+measures the contribution of the units to its consumers. A consumer is any unit that uses the output of a
+given unit. A consumer can be other hidden units or the output units of the network. And the second part
+of the utility measures units’ ability to adapt.
+The first part of our utility measure, called the contribution utility, is defined for each connection or
+weight and each unit. The basic intuition behind the contribution utility is that magnitude of the product
+of units’ activation and outgoing weight gives information about how valuable this connection is to its
+consumers. If a hidden unit’s contribution to its consumer is small, its contribution can be overwhelmed
+by contributions from other hidden units. In such a case, the hidden unit is not useful to its consumer.
+The same measure of connection utility has been proposed for the network pruning problem [58]. We define
+the contribution utility of a hidden unit as the sum of the utilities of all its outgoing connections. The
+contribution utility is measured as a running average of instantaneous contributions with a decay rate, η.
+In a feed-forward neural network, the contribution-utility, cl,i,t, of the ith hidden unit in layer l at time t is
+updated as
+cl,i,t = η ∗ cl,i,t−1 + (1 − η) ∗ |hl,i,t| ∗
+nXl+1
+k=1
+|wl,i,k,t|, (2)
+where hl,i,t is the output of the i
+th hidden unit in layer l at time t, wl,i,k,t is the weight connecting the i
+In one sense, continual backpropagation is a simple and natural extension of the conventional back￾propagation algorithm to continual learning. The conventional backpropagation algorithm has two main
+parts: initialization with small random weights and gradient descent at every time step. This algorithm
+is designed for the train-once setting, where learning happens once and never again. It only initializes the
+connections with small random numbers in the beginning, but continual backpropagation does so continually.
+Continual backpropagation makes conventional backpropagation continual by performing similar comp￾utations at all times. The guiding principle behind continual backpropagation is that good continual learning
+algorithms should do similar computations at all times.
+Continual backpropagation selectively reinitializes low-utility units in the network. Selective reinit￾ialization has two steps. The first step is to find low-utility units and the second is to reinitialize them.
+Every time step, a fraction of hidden units ρ, called replacement-rate, are reinitialized in every layer. When
+a new hidden unit is added, its outgoing weights are initialized to zero. Initializing the outgoing weights
+as zero ensures that the newly added hidden units do not affect the already learned function. However,
+initializing the outgoing weight to zero makes the new unit vulnerable to immediate reinitialized as it has
+zero utility. To protect new units from immediate reinitialization, they are protected from a reinitialization
+for maturity threshold m number of updates.
+One major limitation of prior work on selective reinitialization is that the utility measure is limited to
+networks with a single hidden layer and one output. We overcome this limitation by proposing a utility
+measure that can be applied to arbitrary networks. Our utility measure has two parts. The first part
+measures the contribution of the units to its consumers. A consumer is any unit that uses the output of a
+given unit. A consumer can be other hidden units or the output units of the network. And the second part
+of the utility measures units’ ability to adapt.
+The first part of our utility measure, called the contribution utility, is defined for each connection or
+weight and each unit. The basic intuition behind the contribution utility is that magnitude of the product
+of units’ activation and outgoing weight gives information about how valuable this connection is to its
+consumers. If a hidden unit’s contribution to its consumer is small, its contribution can be overwhelmed
+by contributions from other hidden units. In such a case, the hidden unit is not useful to its consumer.
+The same measure of connection utility has been proposed for the network pruning problem [58]. We define
+the contribution utility of a hidden unit as the sum of the utilities of all its outgoing connections. The
+contribution utility is measured as a running average of instantaneous contributions with a decay rate, η.
+In a feed-forward neural network, the contribution-utility, cl,i,t, of the ith hidden unit in layer l at time t is
+updated as
+cl,i,t = η ∗ cl,i,t−1 + (1 − η) ∗ |hl,i,t| ∗
+nXl+1
+k=1
+|wl,i,k,t|, (2)
+where hl,i,t is the output of the i
+th hidden unit in layer l at time t, wl,i,k,t is the weight connecting the i
+Finally, we define the overall utility of a hidden unit as the running average of the product of its mean￾corrected contribution utility and adaptation utility. The overall utility, ˆul,i,t, becomes
+yl,i,t =
+|hl,i,t − ˆfl,i,t| ∗ Pnl+1
+k=1 |wl,i,k,t|
+Pnl−1
+j=1 |wl−1,j,i,t|
+(6)
+ul,i,t = η ∗ ul,i,t−1 + (1 − η) ∗ yl,i,t, (7)
+uˆl,i,t =
+ul,i,t−1
+1 − η
+al,i,t
+. (8)
+The instantaneous overall utility is depicted in Figure 5.
+The final algorithm combines conventional backpropagation with selective reinitialization to continually
+inject random hidden units from the initial distribution. Continual backpropagation performs a gradient￾descent and selective reinitialization step at each update. Algorithm 1 specifies the continual backpropaga￾tion algorithm for a feed-forward neural network. Our continual backpropagation algorithm overcomes the
+limitation of prior work ([60, 57]) on selective reinitialization and makes it compatible with modern deep
+learning. Prior work had two significant limitations. First, their algorithm was only applicable to neural
+networks with a single hidden layer and a single output. Second, it was limited to LTU activations, binary
+weights, and SGD. We overcome all of these limitations. Our algorithm is applicable to arbitrary feed-forward
+networks. We describe how to use it with modern activations and optimizers like Adam in Appendix E. The
+name “Continual” backpropagation comes from an algorithmic perspective. The backpropagation algorithm,
+as proposed by [19], had two parts, initialization with small random numbers and gradient descent. However,
+initialization only happens initially, so backpropagation is not a continual algorithm as it does not do similar
+computations at all times. On the other hand, continual backpropagation is continual as it performs similar
+computations at all times.
+We then applied continual backpropagation on Continual Imagenet, Online Permuted MNIST, and
+slowly-changing regression. We started with Online Permuted MNIST. We used the same network as in
+the previous section, a network with 3 hidden layers with 2000 hidden units each. We trained the network
+using SGD with a step size of 0.003. For continual backpropagation, we show the online classification
+accuracy for various values of replacement rates. Replacement rate is the main hyperparameter in continual
+backpropagation, it controls how rapidly units are reinitialized in the network. For example, a replacement
+rate of 1e − 4 for our network with 2000 hidden units in each layer would mean replacing one unit in each
+layer after every 5 examples. The hyperparameters for L
+2
+-regularization, Shrink and Perturb, Online Norm,
+Adam, and Dropout were chosen as described in the previous section. The online classification accuracy of
+various algorithms on Online Permuted MNIST is presented in Figure 6a. The results are averaged over
+thirty runs.
+Among all the algorithms, only continual backpropagation has a non-degrading performance. The
+performance of all the other algorithms degrades over time. Additionally, continual backpropagation is
+

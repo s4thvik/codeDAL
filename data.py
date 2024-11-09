@@ -55,6 +55,12 @@ class Data:
     def cal_test_acc(self, preds):
         return np.mean(self.Y_test == preds)
 
+    def get_training_batch(self, batch_size):
+        # Get a random batch of labeled data for continuous training
+        labeled_idxs = np.where(self.labeled_idxs)[0]
+        selected_idxs = np.random.choice(labeled_idxs, batch_size, replace=False)
+        return self.handler(self.X_train[selected_idxs], self.Y_train[selected_idxs])
+
 # Utility functions for loading datasets
 def get_CIFAR100(handler):
     data_train = datasets.CIFAR100('./data/CIFAR100', train=True, download=True)
@@ -83,4 +89,4 @@ def get_CIFAR10(handler):
                 data_test.data, np.array(data_test.targets), handler)
 
 
-#hi2
+#hi3

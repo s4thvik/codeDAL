@@ -7,6 +7,7 @@ from torch.optim.lr_scheduler import StepLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from torchvision import models
+from continual_backprop import ContinualBackprop
 
 class CustomResNet18(nn.Module):
     def __init__(self, num_classes=100):
@@ -20,150 +21,74 @@ class CustomResNet18(nn.Module):
         out = self.model(x)
         return out
 
+    def predict(self, x):
+        features = []
+        x = self.model.conv1(x)
+        x = self.model.bn1(x)
+        x = self.model.relu(x)
+        x = self.model.maxpool(x)
+        
+        x = self.model.layer1(x)
+        x = self.model.layer2(x)
+        x = self.model.layer3(x)
+        x = self.model.layer4(x)
+        
+        x = self.model.avgpool(x)
+        features = x.view(x.size(0), -1)
+        out = self.model.fc(features)
+        return out, features
+
 class ContinualBackpropNet(nn.Module):
     def __init__(self, net_cls, params, device, replacement_rate=0.0001, maturity_threshold=100, decay_rate=0.9):
         super(ContinualBackpropNet, self).__init__()
         self.clf = net_cls(num_classes=params['num_classes']).to(device)
         self.params = params
-        self.optimizer = SGD(self.clf.parameters(), **params['optimizer_args'])
-        # Modified scheduler for better learning rate decay
-        self.scheduler = StepLR(self.optimizer, step_size=30, gamma=0.1)
         self.device = device
-        
-        # CBP parameters
         self.replacement_rate = replacement_rate
         self.maturity_threshold = maturity_threshold
         self.decay_rate = decay_rate
         
-        # Track utilities and ages for each layer
+        # Initialize utilities and ages
         self.utilities = {}
         self.ages = {}
-        self.features = {}
-        
-        # Initialize utilities and ages for each layer
         for name, module in self.clf.named_modules():
-            if isinstance(module, nn.Linear):
-                num_units = module.out_features
-                self.utilities[name] = torch.zeros(num_units).to(device)
-                self.ages[name] = torch.zeros(num_units).to(device)
-            elif isinstance(module, nn.Conv2d):
-                num_units = module.out_channels
-                self.utilities[name] = torch.zeros(num_units).to(device)
-                self.ages[name] = torch.zeros(num_units).to(device)
-            
             if isinstance(module, (nn.Linear, nn.Conv2d)):
-                module.register_forward_hook(self._feature_hook(name))
+                num_units = module.out_features if isinstance(module, nn.Linear) else module.out_channels
+                self.utilities[name] = torch.zeros(num_units).to(device)
+                self.ages[name] = torch.zeros(num_units).to(device)
 
-    def _feature_hook(self, name):
-        def hook(module, input, output):
-            self.features[name] = output.detach()
-        return hook
+        # Initialize CBP optimizer
+        self.cbp = ContinualBackprop(
+            net=self.clf,
+            step_size=params['optimizer_args']['lr'],
+            loss='nll',
+            opt='sgd',
+            replacement_rate=replacement_rate,
+            decay_rate=decay_rate,
+            device=device,
+            maturity_threshold=maturity_threshold,
+            util_type='contribution'
+        )
 
-    def _compute_utility(self, name, module):
-        if name not in self.features:
-            return
-            
-        features = self.features[name]
-        weights = module.weight.data
-        
-        if isinstance(module, nn.Conv2d):
-            # For Conv2d, average across spatial dimensions
-            features = features.mean(dim=(2, 3))  # Average across H,W
-            
-        # Compute mean-corrected contribution utility
-        mean_activations = features.mean(dim=0, keepdim=True)
-        contribution = torch.abs(features - mean_activations).mean(dim=0)
-        
-        # Compute adaptation utility based on layer type
-        if isinstance(module, nn.Conv2d):
-            # For Conv2d: average across input channels, kernel height, and width
-            adaptation = 1 / (weights.abs().mean(dim=(1, 2, 3)) + 1e-10)
-        else:  # Linear layer
-            # For Linear: average across input features
-            adaptation = 1 / (weights.abs().mean(dim=1) + 1e-10)
-        
-        # Ensure dimensions match
-        if contribution.shape != adaptation.shape:
-            if len(contribution.shape) > len(adaptation.shape):
-                contribution = contribution.mean(dim=tuple(range(1, len(contribution.shape))))
-            else:
-                adaptation = adaptation.mean(dim=tuple(range(1, len(adaptation.shape))))
-        
-        # Update utility with decay
-        self.utilities[name] = self.decay_rate * self.utilities[name] + \
-                             (1 - self.decay_rate) * (contribution * adaptation)
-        self.ages[name] += 1
+    def forward(self, x):
+        return self.clf(x)
 
-    def _selective_reinit(self, name, module):
-        if name not in self.utilities:
-            return
-            
-        # Find eligible units for reinitialization
-        mature_units = self.ages[name] > self.maturity_threshold
-        if not mature_units.any():
-            return
-            
-        # Calculate number of units to reinitialize
-        num_reinit = int(self.replacement_rate * mature_units.sum().item())
-        if num_reinit == 0:
-            return
-            
-        # Select units with lowest utility
-        utilities_mature = self.utilities[name][mature_units]
-        _, indices = torch.topk(-utilities_mature, num_reinit)
-        units_to_reinit = torch.where(mature_units)[0][indices]
+    def train_on_batch(self, x, y):
+        x, y = x.to(self.device), y.to(self.device)
+        output, features = self.clf.predict(x)
+        loss = F.cross_entropy(output, y)
         
-        # Reinitialize selected units
-        with torch.no_grad():
-            if isinstance(module, nn.Linear):
-                nn.init.kaiming_uniform_(module.weight[units_to_reinit])
-                if module.bias is not None:
-                    module.bias.data[units_to_reinit] = 0
-            elif isinstance(module, nn.Conv2d):
-                nn.init.kaiming_uniform_(module.weight[units_to_reinit])
-                if module.bias is not None:
-                    module.bias.data[units_to_reinit] = 0
-                    
-            # Reset ages for reinitialized units
-            self.ages[name][units_to_reinit] = 0
-
-    def train_model(self, data):
-        loader = DataLoader(data, **self.params['train_args'])
-        total_loss = 0
-        num_batches = 0
-    
-        for epoch in range(self.params['n_epoch']):
-            epoch_loss = 0
-            self.clf.train()
+        # Standard backprop
+        loss.backward()
+        self.cbp.opt.step()
+        self.cbp.opt.zero_grad()
         
-            with tqdm(loader, desc=f"Epoch {epoch+1}/{self.params['n_epoch']}") as t:
-                for x, y, idxs in t:
-                    x, y = x.to(self.device), y.to(self.device)
-                    
-                    # Forward pass
-                    self.optimizer.zero_grad()
-                    out = self.clf(x)
-                    loss = F.cross_entropy(out, y)
+        # Selective reinitialization
+        for name, module in self.clf.named_modules():
+            if isinstance(module, (nn.Linear, nn.Conv2d)):
+                self._selective_reinit(name, module)
                 
-                    # Backward pass
-                    loss.backward()
-                    self.optimizer.step()
-                
-                    # Apply CBP
-                    for name, module in self.clf.named_modules():
-                        if isinstance(module, (nn.Linear, nn.Conv2d)):
-                            self._compute_utility(name, module)
-                            self._selective_reinit(name, module)
-                
-                    epoch_loss += loss.item()
-                    num_batches += 1
-                    t.set_postfix(loss=loss.item())
-                
-            avg_loss = epoch_loss / num_batches
-            print(f"Epoch {epoch+1} Average Loss: {avg_loss:.4f}")
-            self.scheduler.step()
-        
-        return avg_loss
+        return loss, output, features
 
     def predict(self, data):
         self.clf.eval()
@@ -189,7 +114,85 @@ class ContinualBackpropNet(nn.Module):
                 probs[idxs] = prob.cpu()
         return probs
 
-# Define ResNet-18 for CIFAR-100
+    def update_utilities(self, name, features, output):
+        if name not in self.utilities:
+            return
+            
+        layer = dict(self.clf.named_modules())[name]
+        
+        # Calculate mean-corrected features
+        if not hasattr(self, 'running_means'):
+            self.running_means = {}
+        if not hasattr(self, 'adaptation_utilities'):
+            self.adaptation_utilities = {}
+        
+        # Update running means
+        if name not in self.running_means:
+            self.running_means[name] = features.mean(0)
+            self.adaptation_utilities[name] = torch.ones_like(self.utilities[name])
+        else:
+            self.running_means[name] = self.decay_rate * self.running_means[name] + \
+                                      (1 - self.decay_rate) * features.mean(0)
+        
+        # Calculate instantaneous utility (equation 6)
+        mean_corrected = torch.abs(features - self.running_means[name].unsqueeze(0))  # [B, F]
+        
+        if isinstance(layer, nn.Linear):
+            outgoing_weights = torch.abs(layer.weight)  # [out_features, in_features]
+            incoming_weights = outgoing_weights.sum(dim=0)  # [in_features]
+            
+            # Calculate yl,i,t according to equation 6
+            contribution = mean_corrected @ outgoing_weights.t()  # [B, out_features]
+            y_l_i_t = contribution / (incoming_weights.sum() + 1e-8)  # [B, out_features]
+            
+            # Update running average (equation 7)
+            self.utilities[name] = self.decay_rate * self.utilities[name] + \
+                                  (1 - self.decay_rate) * y_l_i_t.mean(0)
+            
+            # Calculate final utility with adaptation factor (equation 8)
+            self.utilities[name] = self.utilities[name] * self.adaptation_utilities[name]
+
+    def _selective_reinit(self, name, module):
+        if name not in self.utilities:
+            return
+            
+        # Only consider units past protection period
+        mature_units = self.ages[name] > self.maturity_threshold
+        if not mature_units.any():
+            return
+            
+        num_reinit = int(self.replacement_rate * mature_units.sum().item())
+        if num_reinit > 0:
+            utilities_mature = self.utilities[name][mature_units]
+            _, indices = torch.topk(-utilities_mature, num_reinit)
+            units_to_reinit = torch.where(mature_units)[0][indices]
+            
+            # Zero outgoing weights for new units (as per lines 504-506)
+            with torch.no_grad():
+                module.weight[units_to_reinit].zero_()
+                if module.bias is not None:
+                    module.bias.data[units_to_reinit] = 0
+                    
+            # Reset ages for protection period
+            self.ages[name][units_to_reinit] = 0
+
+    def train_model(self, labeled_data):
+        """Train model on labeled data for one epoch"""
+        self.train()
+        total_loss = 0
+        loader = DataLoader(labeled_data, **self.params['train_args'])
+        
+        for x, y, idxs in loader:
+            loss, output, features = self.train_on_batch(x, y)
+            total_loss += loss.item()
+            
+            # Update utilities after each batch
+            for name, module in self.clf.named_modules():
+                if isinstance(module, (nn.Linear, nn.Conv2d)):
+                    self.update_utilities(name, features, output)
+        
+        return total_loss / len(loader)
+
 class BasicBlock(nn.Module):
     def __init__(self, in_planes, planes, stride=1):
         super(BasicBlock, self).__init__()
@@ -245,7 +248,7 @@ class ResNet(nn.Module):
         out = x.view(x.size(0), -1)
         e1 = out
         out = self.linear(out)
-        return out, e1  # return embedding for compatibility with current structure
+        return out, e1
 
     def get_embedding_dim(self):
         return 512
@@ -325,4 +328,4 @@ class CIFAR10_Net(nn.Module):
         return 512
 
 
-#hi6
+#hi1

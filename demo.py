@@ -8,6 +8,7 @@ from utils import get_dataset, get_net, get_strategy, params
 from torch.linalg import matrix_rank
 from sklearn.metrics import classification_report
 from nets import ContinualBackpropNet
+from torch.utils.data import DataLoader
 
 # Initialize the argument parser
 parser = argparse.ArgumentParser()
@@ -130,6 +131,27 @@ def log_statistics(round_num, loss, acc, per_class_acc, dead_units, avg_dead_uni
     experiment_log.write(log_entry)
     summary_log.write(log_entry)
 
+def train_epoch(strategy, loader):
+    strategy.net.train()
+    total_loss = 0
+    correct = 0
+    total = 0
+    
+    for x, y, idxs in tqdm(loader):
+        loss, output, features = strategy.net.train_on_batch(x, y)
+        total_loss += loss.item()
+        
+        _, predicted = output.max(1)
+        total += y.size(0)
+        correct += predicted.eq(y.to(strategy.net.device)).sum().item()
+        
+        # Update utilities after each batch
+        for name, layer in strategy.net.clf.named_modules():
+            if isinstance(layer, nn.Linear):
+                strategy.net.update_utilities(name, features, output)
+    
+    return total_loss / len(loader), correct / total
+
 # Round 0 training
 print("Round 0")
 loss_round_0 = strategy.train()
@@ -169,10 +191,20 @@ for rd in range(1, args.n_round + 1):
     query_idxs = strategy.query(args.n_query)
     strategy.update(query_idxs)
     
-    # Track class distribution before training
-    dist_str, _ = track_class_distribution(dataset, query_idxs, rd)
+    # Create train loader for this round
+    train_loader = DataLoader(
+        dataset.get_train_data(),
+        **params[args.dataset_name]['train_args']
+    )
     
-    loss = strategy.train()
+    # Train with utility tracking
+    total_loss = 0
+    for epoch in range(params[args.dataset_name]['n_epoch']):
+        for x, y, idxs in train_loader:
+            loss, output, features = strategy.net.train_on_batch(x, y)
+            total_loss += loss.item()
+    
+    loss = total_loss / len(train_loader)
     preds = strategy.predict(dataset.get_test_data())
     round_accuracy = dataset.cal_test_acc(preds)
     per_class_acc = classification_report(dataset.Y_test, preds, output_dict=True, zero_division=0)
@@ -207,13 +239,21 @@ summary_log.close()
 print("Experiment complete. Check 'exp_output.log' for detailed logs and 'summary_output.txt' for summary.")
 
 
+def track_plasticity_metrics(self):
+    """Track metrics to verify CBP is maintaining plasticity"""
+    metrics = {}
+    for name, module in self.clf.named_modules():
+        if isinstance(module, (nn.Linear, nn.Conv2d)):
+            # Track dead units
+            weight_norms = torch.norm(module.weight, dim=1)
+            metrics[f'{name}_dead_units'] = (weight_norms < 1e-6).float().mean().item()
+            
+            # Track utility distribution
+            if name in self.utilities:
+                metrics[f'{name}_utility_mean'] = self.utilities[name].mean().item()
+                metrics[f'{name}_utility_std'] = self.utilities[name].std().item()
+    
+    return metrics
 
 
-
-
-
-
-
-
-
-
+#hi2
