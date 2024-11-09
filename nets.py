@@ -78,23 +78,49 @@ class ContinualBackpropNet(nn.Module):
                 
     def train_model(self, labeled_data):
         """Train using CBP instead of standard backprop"""
+        from tqdm import tqdm
         self.train()
         total_loss = 0
-        loader = DataLoader(labeled_data, **self.params['train_args'])
+        metrics = {}
+        n_epochs = self.params['train_args'].get('num_epochs', 100)
         
-        for x, y, idxs in loader:
-            x, y = x.to(self.device), y.to(self.device)
-            loss, output, features = self.train_on_batch(x, y)
-            total_loss += loss.item()
+        # Create epoch-level progress bar
+        epoch_pbar = tqdm(range(n_epochs), desc='Training Epochs', leave=True)
+        
+        for epoch in epoch_pbar:
+            loader = DataLoader(labeled_data, **self.params['train_args'])
+            # Create batch-level progress bar
+            batch_pbar = tqdm(loader, desc=f'Epoch {epoch+1}', leave=False)
+            epoch_loss = 0
             
-            # Update utilities and perform selective reinitialization
-            for name, layer in self.clf.named_modules():
-                if isinstance(layer, nn.Linear):
-                    self.update_utilities(name, features, output)
-                    self._selective_reinit(name, layer)
-                    self.ages[name] += 1
+            for x, y, idxs in batch_pbar:
+                x, y = x.to(self.device), y.to(self.device)
+                loss, output, features = self.train_on_batch(x, y)
+                epoch_loss += loss.item()
+                
+                # Update utilities and perform selective reinitialization
+                for name, layer in self.clf.named_modules():
+                    if isinstance(layer, nn.Linear):
+                        self.update_utilities(name, features, output)
+                        self._selective_reinit(name, layer)
+                        self.ages[name] += 1
+                        
+                        metrics[name] = {
+                            'utility': self.utilities[name].mean().item(),
+                            'age': self.ages[name].mean().item()
+                        }
+                
+                # Update batch progress bar
+                batch_pbar.set_postfix({'batch_loss': f'{loss.item():.4f}'})
+            
+            avg_epoch_loss = epoch_loss / len(loader)
+            total_loss += avg_epoch_loss
+            
+            # Update epoch progress bar
+            epoch_pbar.set_postfix({'avg_loss': f'{avg_epoch_loss:.4f}'})
         
-        return total_loss / len(loader)
+        avg_loss = total_loss / n_epochs
+        return avg_loss, metrics
 
     def forward(self, x):
         return self.clf(x)
@@ -154,16 +180,28 @@ class ContinualBackpropNet(nn.Module):
                                       (1 - self.decay_rate) * features.mean(0))
         
         # Calculate mean-corrected contribution (equation 6 from paper)
-        mean_corrected = torch.abs(features - self.running_means[name])
+        mean_corrected = torch.abs(features - self.running_means[name])  # [batch_size, feature_dim]
+        
+        # Get weight dimensions
+        out_features, in_features = layer.weight.shape
         
         # Calculate weight terms
-        outgoing_weights = torch.abs(layer.weight).sum(dim=0)
-        incoming_weights = torch.abs(layer.weight).sum(dim=1)
+        outgoing_weights = torch.abs(layer.weight).sum(dim=0)  # [in_features]
+        incoming_weights = torch.abs(layer.weight).sum(dim=1)  # [out_features]
         
-        # Update utility (equations 7-8 from paper)
-        instantaneous_utility = (mean_corrected * outgoing_weights) / (incoming_weights + 1e-8)
+        # Calculate contribution term
+        contribution = mean_corrected * outgoing_weights.unsqueeze(0)  # [batch_size, in_features]
+        contribution = contribution.mean(0)  # [in_features]
+        
+        # Reshape contribution to match incoming weights
+        contribution = contribution.unsqueeze(1).expand(-1, out_features)  # [in_features, out_features]
+        
+        # Calculate instantaneous utility
+        instantaneous_utility = (contribution / (incoming_weights + 1e-8)).mean(0)  # [out_features]
+        
+        # Update utility using equation 7 from the paper
         self.utilities[name] = (self.decay_rate * self.utilities[name] + 
-                              (1 - self.decay_rate) * instantaneous_utility.mean(0))
+                              (1 - self.decay_rate) * instantaneous_utility)
 
     def _selective_reinit(self, name, module):
         if name not in self.utilities:
@@ -324,4 +362,4 @@ class CIFAR10_Net(nn.Module):
         return 512
 
 
-#hi5
+#hi3
